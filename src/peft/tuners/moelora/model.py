@@ -46,15 +46,15 @@ from peft.utils import (
 from peft.utils.merge_utils import dare_linear, dare_ties, magnitude_prune, task_arithmetic, ties
 from peft.utils.other import get_pattern_key
 
-from .aqlm import dispatch_aqlm
-from .awq import dispatch_awq
-from .config import LoraConfig
-from .eetq import dispatch_eetq
-from .gptq import dispatch_gptq
-from .hqq import dispatch_hqq
-from .layer import Conv2d, LoraLayer, dispatch_default
-from .torchao import dispatch_torchao
-from .tp_layer import dispatch_megatron
+# from .aqlm import dispatch_aqlm
+# from .awq import dispatch_awq
+from .config import MoELoraConfig
+# from .eetq import dispatch_eetq
+# from .gptq import dispatch_gptq
+# from .hqq import dispatch_hqq
+from .layer import Conv2d, MoELoraLayer, dispatch_default
+# from .torchao import dispatch_torchao
+# from .tp_layer import dispatch_megatron
 
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -63,7 +63,7 @@ def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
     return args, kwargs
 
 
-class LoraModel(BaseTuner):
+class MoELoraModel(BaseTuner):
     """
     Creates Low Rank Adapter (LoRA) model from a pretrained transformers model.
 
@@ -136,7 +136,7 @@ class LoraModel(BaseTuner):
         - **peft_config** ([`LoraConfig`]): The configuration of the Lora model.
     """
 
-    prefix: str = "lora_"
+    prefix: str = "moelora_"
 
     def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False) -> None:
         super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
@@ -221,7 +221,7 @@ class LoraModel(BaseTuner):
         # note: AdaLoraLayer is a subclass of LoraLayer, we need to exclude it
         from peft.tuners.adalora import AdaLoraLayer
 
-        if isinstance(target, LoraLayer) and not isinstance(target, AdaLoraLayer):
+        if isinstance(target, MoELoraLayer) and not isinstance(target, AdaLoraLayer):
             target.update_layer(
                 adapter_name,
                 r,
@@ -282,7 +282,7 @@ class LoraModel(BaseTuner):
                         p.requires_grad = True
             elif bias == "lora_only":
                 for m in model.modules():
-                    if isinstance(m, LoraLayer) and hasattr(m, "bias") and m.bias is not None:
+                    if isinstance(m, MoELoraLayer) and hasattr(m, "bias") and m.bias is not None:
                         m.bias.requires_grad = True
             else:
                 raise NotImplementedError(f"Requested bias: {bias}, is not implemented.")
@@ -315,12 +315,12 @@ class LoraModel(BaseTuner):
 
         # avoid eager bnb import
         if is_bnb_available():
-            from .bnb import dispatch_bnb_8bit
+            from ..lora.bnb import dispatch_bnb_8bit
 
             dispatchers.append(dispatch_bnb_8bit)
 
         if is_bnb_4bit_available():
-            from .bnb import dispatch_bnb_4bit
+            from ..lora.bnb import dispatch_bnb_4bit
 
             dispatchers.append(dispatch_bnb_4bit)
 
@@ -414,7 +414,7 @@ class LoraModel(BaseTuner):
             adapter_name (`str` or `list[str]`): Name of the adapter(s) to be activated.
         """
         for module in self.model.modules():
-            if isinstance(module, LoraLayer):
+            if isinstance(module, MoELoraLayer):
                 if module.merged:
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
@@ -438,7 +438,7 @@ class LoraModel(BaseTuner):
         # to check that there is at least one layer with the given name, or else something like typos can easily slip.
         expected_adapters = set()
         for layer in self.modules():
-            if isinstance(layer, LoraLayer):
+            if isinstance(layer, MoELoraLayer):
                 expected_adapters |= layer.lora_A.keys()
                 expected_adapters |= layer.lora_embedding_A.keys()
         unique_adapters = {name for name in adapter_names if name != "__base__"}
@@ -460,7 +460,7 @@ class LoraModel(BaseTuner):
 
         hook_handles = []
         for module in self.modules():
-            if isinstance(module, LoraLayer) or isinstance(module, AuxiliaryTrainingWrapper):
+            if isinstance(module, MoELoraLayer) or isinstance(module, AuxiliaryTrainingWrapper):
                 pre_forward = partial(_adapter_names_pre_forward_hook, adapter_names=adapter_names)
                 handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
                 hook_handles.append(handle)
@@ -469,7 +469,7 @@ class LoraModel(BaseTuner):
             # For encoder-decoder models, even when applying beam search, the encoder part of the model should not use
             # the extended adapter_names. This is because the encoder still uses the original, non-extended samples.
             for module in self.model.get_encoder().modules():
-                if isinstance(module, LoraLayer) or isinstance(module, AuxiliaryTrainingWrapper):
+                if isinstance(module, MoELoraLayer) or isinstance(module, AuxiliaryTrainingWrapper):
                     # Add another hook to overwrite the kwargs with the original adapter names -- this is easier than
                     # trying to exclude the encoder.
                     pre_forward = partial(_adapter_names_pre_forward_hook, adapter_names=original_adapter_names)
@@ -677,7 +677,7 @@ class LoraModel(BaseTuner):
         key_list = [key for key, _ in self.model.named_modules() if self.prefix not in key]
         for key in key_list:
             _, target, _ = _get_submodules(self.model, key)
-            if isinstance(target, LoraLayer):
+            if isinstance(target, MoELoraLayer):
                 if adapter_name in target.lora_A:
                     target_lora_A = target.lora_A[adapter_name].weight
                     target_lora_B = target.lora_B[adapter_name].weight
@@ -862,7 +862,7 @@ class LoraModel(BaseTuner):
         new_adapter = None
         for key in key_list:
             _, target, _ = _get_submodules(self.model, key)
-            if isinstance(target, LoraLayer):
+            if isinstance(target, MoELoraLayer):
                 target.delete_adapter(adapter_name)
                 if new_adapter is None:
                     new_adapter = target.active_adapters[:]

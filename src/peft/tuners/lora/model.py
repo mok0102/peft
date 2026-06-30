@@ -198,6 +198,7 @@ class LoraModel(BaseTuner):
             "fan_in_fan_out": lora_config.fan_in_fan_out,
             "init_lora_weights": lora_config.init_lora_weights,
             "use_rslora": lora_config.use_rslora,
+            "use_moelora": lora_config.use_moelora,
             "use_dora": lora_config.use_dora,
             "ephemeral_gpu_offload": lora_config.runtime_config.ephemeral_gpu_offload,
             "lora_bias": lora_config.lora_bias,
@@ -229,6 +230,7 @@ class LoraModel(BaseTuner):
                 lora_dropout=lora_config.lora_dropout,
                 init_lora_weights=lora_config.init_lora_weights,
                 use_rslora=lora_config.use_rslora,
+                use_moelora=lora_config.use_moelora,
                 use_dora=lora_config.use_dora,
                 lora_bias=lora_config.lora_bias,
             )

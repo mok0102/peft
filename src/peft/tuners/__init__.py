@@ -43,6 +43,7 @@ from .trainable_tokens import TrainableTokensConfig, TrainableTokensModel
 from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .xlora import XLoraConfig, XLoraModel
+from .moelora import MoELoraConfig, MoELoraModel
 
 
 __all__ = [
@@ -77,6 +78,8 @@ __all__ = [
     "MultitaskPromptEmbedding",
     "MultitaskPromptTuningConfig",
     "MultitaskPromptTuningInit",
+    "MoeLoraConfig",
+    "MoELoraModel",
     "OFTConfig",
     "OFTModel",
     "PolyConfig",

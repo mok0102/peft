@@ -51,6 +51,9 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
+        
+        self.lora_gate = nn.ModuleDict({}) ### For MoE Moelora
+        
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -125,6 +128,8 @@ class LoraLayer(BaseTunerLayer):
         init_lora_weights,
         use_rslora,
         use_dora: bool = False,
+        use_moelora: bool = False,
+        num_experts: int = 3,
         lora_bias: bool = False,
     ):
         # This code works for linear layers, override for other layer types
@@ -148,6 +153,19 @@ class LoraLayer(BaseTunerLayer):
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
+            
+        if use_moelora:
+            self.num_experts = num_experts
+            
+            self.lora_gate[adapter_name] = nn.Linear(self.in_features, self.num_experts, bias=True)
+            nn.init.zeros_(self.lora_gate[adapter_name].weight)
+            
+            self.lora_A[adapter_name] = nn.ModuleList(
+                [nn.Linear(self.in_features, r, bias=False) for _ in range(num_experts)]
+            )
+            self.lora_B[adapter_name] = nn.ModuleList(
+                [nn.Linear(r, self.out_features, bias=lora_bias) for _ in range(num_experts)]
+            )
 
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
@@ -165,7 +183,7 @@ class LoraLayer(BaseTunerLayer):
         elif init_lora_weights == "eva":
             nn.init.zeros_(self.lora_B[adapter_name].weight)
         elif init_lora_weights:
-            self.reset_lora_parameters(adapter_name, init_lora_weights)
+            self.reset_lora_parameters(adapter_name, init_lora_weights, use_moelora)
         # call this before dora_init
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
@@ -177,22 +195,39 @@ class LoraLayer(BaseTunerLayer):
 
         self.set_adapter(self.active_adapters)
 
-    def reset_lora_parameters(self, adapter_name, init_lora_weights):
+    def reset_lora_parameters(self, adapter_name, init_lora_weights, use_moelora):
         if init_lora_weights is False:
             return
 
         if adapter_name in self.lora_A.keys():
+                        
             if init_lora_weights is True:
                 # initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                if use_moelora and len(self.lora_A[adapter_name])>1:
+                    
+                    for i in range(self.num_experts): nn.init.kaiming_uniform_(self.lora_A[adapter_name][i].weight, a=math.sqrt(5))
+                else:
+                    nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
             elif init_lora_weights.lower() == "gaussian":
-                nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                if len(self.lora_A[adapter_name])>1 and use_moelora:
+                    for i in range(self.num_experts): nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
+                else:
+                    nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
-            if self.lora_bias[adapter_name]:
-                nn.init.zeros_(self.lora_B[adapter_name].bias)
+            
+            if use_moelora and len(self.lora_B[adapter_name])>1:
+                for i in range(self.num_experts):
+                    nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+                    if self.lora_bias[adapter_name]:
+                        nn.init.zeros_(self.lora_B[adapter_name][i].bias)
+
+            else:   
+                nn.init.zeros_(self.lora_B[adapter_name].weight)
+                if self.lora_bias[adapter_name]:
+                    nn.init.zeros_(self.lora_B[adapter_name].bias)
+                    
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
@@ -532,6 +567,7 @@ class Linear(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
+        use_moelora: bool = False,
         lora_bias: bool = False,
         **kwargs,
     ) -> None:
@@ -548,9 +584,12 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            use_moelora=use_moelora,
             lora_bias=lora_bias,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
+        
+        self.use_moelora = use_moelora
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -677,22 +716,52 @@ class Linear(nn.Module, LoraLayer):
         # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
         # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
         cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
+        
+        if self.use_moelora:
+            raise NotImplementedError("get_delta_weight not implemented for MoE LoRA.")
+            ##### NOT POSSIBLE!!! SHOULD BE HANDLED IN FORWARD #####
+            # # MoE LoRA
+            # weight_A_list = self.lora_A[adapter]
+            # weight_B_list = self.lora_B[adapter]
+            # r = self.r[adapter]
+            # out_features = self.out_features
+            
+            # output_tensor = torch.zeros((out_features, self.in_features), device=device, dtype=dtype)
+            
+            # for i in range(self.num_experts):
+            #     weight_A = weight_A_list[i].weight
+            #     weight_B = weight_B_list[i].weight
 
-        weight_A = self.lora_A[adapter].weight
-        weight_B = self.lora_B[adapter].weight
+            #     if cast_to_fp32:
+            #         weight_A = weight_A.float()
+            #         weight_B = weight_B.float()
 
-        if cast_to_fp32:
-            weight_A = weight_A.float()
-            weight_B = weight_B.float()
+            #     output_tensor += transpose(weight_B @ weight_A, self.fan_in_fan_out) * (self.scaling[adapter] / self.num_experts) * self.lora_route
 
-        output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+            # if cast_to_fp32:
+            #     output_tensor = output_tensor.to(dtype=dtype)
 
-        if cast_to_fp32:
-            output_tensor = output_tensor.to(dtype=dtype)
+            #     # cast back the weights
+            #     for i in range(self.num_experts):
+            #         self.lora_A[adapter][i].weight.data = weight_A.to(dtype)
+            #         self.lora_B[adapter][i].weight.data = weight_B.to(dtype)
 
-            # cast back the weights
-            self.lora_A[adapter].weight.data = weight_A.to(dtype)
-            self.lora_B[adapter].weight.data = weight_B.to(dtype)
+        else:
+            weight_A = self.lora_A[adapter].weight
+            weight_B = self.lora_B[adapter].weight
+
+            if cast_to_fp32:
+                weight_A = weight_A.float()
+                weight_B = weight_B.float()
+
+            output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+
+            if cast_to_fp32:
+                output_tensor = output_tensor.to(dtype=dtype)
+
+                # cast back the weights
+                self.lora_A[adapter].weight.data = weight_A.to(dtype)
+                self.lora_B[adapter].weight.data = weight_B.to(dtype)
 
         return output_tensor
 
@@ -708,42 +777,70 @@ class Linear(nn.Module, LoraLayer):
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
-        else:
+        else: #### MoeLORA gets here
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
-
+            
             lora_A_keys = self.lora_A.keys()
             for active_adapter in self.active_adapters:
                 if active_adapter not in lora_A_keys:
                     continue
+                
+                if not self.use_moelora:
+                    lora_A = self.lora_A[active_adapter]
+                    lora_B = self.lora_B[active_adapter]
+                    dropout = self.lora_dropout[active_adapter]
+                    scaling = self.scaling[active_adapter]
+                    x = self._cast_input_dtype(x, lora_A.weight.dtype)
 
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                x = self._cast_input_dtype(x, lora_A.weight.dtype)
-
-                if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
-                else:
-                    if isinstance(dropout, nn.Identity) or not self.training:
-                        base_result = result
+                    if not self.use_dora[active_adapter]:
+                        result = result + lora_B(lora_A(dropout(x))) * scaling
                     else:
-                        x = dropout(x)
-                        base_result = None
+                        if isinstance(dropout, nn.Identity) or not self.training:
+                            base_result = result
+                        else:
+                            x = dropout(x)
+                            base_result = None
 
-                    result = result + self.lora_magnitude_vector[active_adapter](
-                        x,
-                        lora_A=lora_A,
-                        lora_B=lora_B,
-                        scaling=scaling,
-                        base_layer=self.get_base_layer(),
-                        base_result=base_result,
-                    )
+                        result = result + self.lora_magnitude_vector[active_adapter](
+                            x,
+                            lora_A=lora_A,
+                            lora_B=lora_B,
+                            scaling=scaling,
+                            base_layer=self.get_base_layer(),
+                            base_result=base_result,
+                        )
+                        
+                else:
+                    # MoE LoRA
+                    lora_gate = self.lora_gate[active_adapter]
+                    lora_A_list = self.lora_A[active_adapter]
+                    lora_B_list = self.lora_B[active_adapter]
+                    dropout = self.lora_dropout[active_adapter]
+                    scaling = self.scaling[active_adapter]
+                    x = self._cast_input_dtype(x, lora_gate.weight.dtype)
+
+                    gate_scores = F.softmax(lora_gate(x), dim=-1)  # (batch_size, num_experts)
+
+                    lora_output = torch.zeros_like(result, dtype=lora_B_list[0].weight.dtype)
+
+                    for i in range(self.num_experts):
+                        lora_A = lora_A_list[i]
+                        lora_B = lora_B_list[i]
+                        expert_output = lora_B(lora_A(dropout(x)))  # (batch_size, out_features)
+                        expert_output = expert_output * scaling
+                        gate_score = gate_scores[:, :, i].unsqueeze(-1)  # (batch_size, 1)
+                        
+                        lora_output += expert_output * gate_score  # weighted sum
+
+                    result = result + lora_output
 
             result = result.to(torch_result_dtype)
+            # print(torch.mean(gate_scores, dim=1))
 
+        ##### 여기서 웨이트 뽑을 때만 gate_scores 뽑아서 리턴하도록 해야할듯. 
         return result
+        # return result#, gate_scores
 
     def __repr__(self) -> str:
         rep = super().__repr__()

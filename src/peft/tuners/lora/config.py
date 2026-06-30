@@ -347,6 +347,14 @@ class LoraConfig(PeftConfig):
             )
         },
     )
+    use_moelora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "MoELoRA enables Mixture of Experts (MoE) adapters where each adapter consists of multiple "
+            )
+        },
+    )
     modules_to_save: Optional[list[str]] = field(
         default=None,
         metadata={
@@ -616,6 +624,14 @@ class LoraConfig(PeftConfig):
                 "base weights PiSSA/CorDA/OLoRA means that you won't be able to pass "
                 "`path_initial_model_for_weight_conversion` to `save_pretrained` to restore the initial values of the "
                 "base weights; if you intend to do this, please ensure not to use rslora or rank_pattern/alpha_pattern."
+            )
+            warnings.warn(msg)
+            
+        if self.use_moelora:
+            msg = (
+                "Mixture of Experts LoRA (MoELoRA) is an experimental feature and may not work as expected. "
+                "IMPLEMENTED BY MOK! "
+                # "Please refer to the documentation for more details."
             )
             warnings.warn(msg)
 

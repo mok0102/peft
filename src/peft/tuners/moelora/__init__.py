@@ -18,8 +18,8 @@ from peft.utils import register_peft_method
 from .config import MoELoraConfig
 # from .eva import get_eva_state_dict, initialize_lora_eva_weights
 # from .gptq import GPTQLoraLinear
-from .layer import Conv2d, Conv3d, Embedding, Linear, LoraLayer
-from .model import LoraModel
+from .layer import Conv2d, Conv3d, Embedding, Linear, MoELoraLayer
+from .model import MoELoraModel
 
 
 __all__ = [
@@ -38,7 +38,7 @@ __all__ = [
     "initialize_lora_eva_weights",
 ]
 
-register_peft_method(name="lora", config_cls=LoraConfig, model_cls=LoraModel, is_mixed_compatible=True)
+# register_peft_method(name="moelora", config_cls=MoELoraConfig, model_cls=MoELoraModel, is_mixed_compatible=True)
 
 
 # def __getattr__(name):
